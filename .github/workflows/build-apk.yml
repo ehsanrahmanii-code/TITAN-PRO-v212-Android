@@ -1,0 +1,244 @@
+name: Build Titan PRO v2.1.2 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Android APK (full TITAN PRO v2.1.2 source)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack full TITAN PRO source from ZIP
+        run: |
+          set -e
+          ZIP=""
+          for c in TITAN_PRO_v2_1_2.zip TITAN_PRO*.zip titan*.zip; do
+            if [ -f "$c" ] && [ "$(wc -c < "$c")" -gt 50000 ]; then ZIP="$c"; break; fi
+          done
+          if [ -z "$ZIP" ]; then
+            for c in *.zip; do
+              [ -f "$c" ] || continue
+              if [ "$(wc -c < "$c")" -gt 50000 ]; then ZIP="$c"; break; fi
+            done
+          fi
+          test -n "$ZIP"
+          echo "Using ZIP: $ZIP ($(wc -c < "$ZIP") bytes)"
+
+          rm -rf /tmp/titan_src
+          mkdir -p /tmp/titan_src
+          unzip -oq "$ZIP" -d /tmp/titan_src
+
+          ROOT=""
+          if [ -d /tmp/titan_src/titan/app ]; then
+            ROOT=/tmp/titan_src/titan
+          elif [ -d /tmp/titan_src/app ]; then
+            ROOT=/tmp/titan_src
+          else
+            ROOT=$(find /tmp/titan_src -type d -name app | head -1 | xargs -r dirname)
+          fi
+          test -n "$ROOT"
+          test -d "$ROOT/app"
+          echo "ROOT=$ROOT"
+          ls -la "$ROOT"
+
+          DEST="app/src/main/python"
+          mkdir -p "$DEST"
+
+          if [ -f "$DEST/android_main.py" ]; then
+            cp -f "$DEST/android_main.py" /tmp/android_main.py.bak
+          fi
+
+          rm -rf "$DEST/app" "$DEST/secret" "$DEST/run.py" "$DEST/requirements.txt" "$DEST/YYY" "$DEST/XXX" || true
+          cp -a "$ROOT/app" "$DEST/"
+          [ -d "$ROOT/secret" ] && cp -a "$ROOT/secret" "$DEST/" || mkdir -p "$DEST/secret"
+          [ -f "$ROOT/run.py" ] && cp -f "$ROOT/run.py" "$DEST/"
+          [ -f "$ROOT/requirements.txt" ] && cp -f "$ROOT/requirements.txt" "$DEST/"
+
+          if [ -f /tmp/android_main.py.bak ]; then
+            cp -f /tmp/android_main.py.bak "$DEST/android_main.py"
+          fi
+
+          python3 << 'PY'
+          from pathlib import Path
+          cfg = Path("app/src/main/python/app/config.py")
+          if cfg.is_file():
+              t = cfg.read_text(encoding="utf-8", errors="replace")
+              lines = t.splitlines(keepends=True)
+              out = []
+              if "import os" not in t:
+                  out.append("import os\n")
+              if "from pathlib import Path" not in t and "import pathlib" not in t:
+                  out.append("from pathlib import Path\n")
+              for line in lines:
+                  s = line.strip()
+                  if s.startswith("DATA_DIR") and "environ" not in line and "getenv" not in line:
+                      out.append('DATA_DIR = Path(os.environ.get("TITAN_DATA") or "YYY")\n')
+                  elif 'HOST = "0.0.0.0"' in line or "HOST = '0.0.0.0'" in line:
+                      out.append('HOST = "127.0.0.1"\n')
+                  else:
+                      out.append(line)
+              cfg.write_text("".join(out), encoding="utf-8")
+              print("patched config.py")
+          st = Path("app/src/main/python/app/web/static")
+          print("static", st.is_dir(), "nfiles", len(list(st.rglob('*'))) if st.is_dir() else 0)
+          print("app.py", Path("app/src/main/python/app/web/app.py").is_file())
+          print("titan.css", (st / "css/titan.css").is_file() if st.is_dir() else False)
+          print("t-core.js", (st / "js/t-core.js").is_file() if st.is_dir() else False)
+          PY
+
+          echo "=== python tree ==="
+          find "$DEST" -type f | sort | head -80
+          test -f "$DEST/android_main.py"
+          test -f "$DEST/app/web/app.py"
+          test -f "$DEST/app/web/static/css/titan.css"
+          test -f "$DEST/app/web/static/js/t-core.js"
+          echo "SOURCE OK"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Android SDK packages
+        run: |
+          set -e
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fsSL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses >/dev/null 2>&1 || true
+          sdkmanager --sdk_root="$ANDROID_HOME" --install \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Create NEON launcher icons
+        run: |
+          python3 - << 'PY'
+          from pathlib import Path
+          try:
+              from PIL import Image, ImageDraw, ImageFilter
+          except ImportError:
+              import subprocess, sys
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "pillow", "-q"])
+              from PIL import Image, ImageDraw, ImageFilter
+
+          def neon_icon(size: int) -> Image.Image:
+              img = Image.new("RGBA", (size, size), (8, 10, 18, 255))
+              draw = ImageDraw.Draw(img)
+              margin = size // 10
+              glow = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              gdraw = ImageDraw.Draw(glow)
+              gdraw.ellipse([margin, margin, size - margin, size - margin], fill=(0, 240, 255, 90))
+              glow = glow.filter(ImageFilter.GaussianBlur(radius=size // 8))
+              img = Image.alpha_composite(img, glow)
+              draw = ImageDraw.Draw(img)
+              m2 = size // 6
+              draw.ellipse([m2, m2, size - m2, size - m2], outline=(0, 255, 255, 220), width=max(2, size // 32))
+              cx, cy = size // 2, size // 2
+              bar_h = max(3, size // 12)
+              bar_w = size // 2
+              stem_w = max(3, size // 10)
+              stem_h = size // 2
+              x0 = cx - bar_w // 2
+              y0 = cy - stem_h // 2
+              draw.rounded_rectangle([x0, y0, x0 + bar_w, y0 + bar_h], radius=bar_h // 2, fill=(0, 255, 255, 255))
+              x1 = cx - stem_w // 2
+              y1 = y0
+              draw.rounded_rectangle([x1, y1, x1 + stem_w, y1 + stem_h], radius=stem_w // 2, fill=(0, 255, 255, 255))
+              letter = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              ld = ImageDraw.Draw(letter)
+              ld.rounded_rectangle([x0, y0, x0 + bar_w, y0 + bar_h], radius=bar_h // 2, fill=(0, 255, 255, 180))
+              ld.rounded_rectangle([x1, y1, x1 + stem_w, y1 + stem_h], radius=stem_w // 2, fill=(0, 255, 255, 180))
+              letter = letter.filter(ImageFilter.GaussianBlur(radius=max(2, size // 20)))
+              img = Image.alpha_composite(img, letter)
+              return img
+
+          base = Path("app/src/main/res")
+          for dens, size in [("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)]:
+              d = base / f"mipmap-{dens}"
+              d.mkdir(parents=True, exist_ok=True)
+              neon_icon(size).save(d / "ic_launcher.png")
+          print("neon icons ok")
+          PY
+
+      - name: Gradle wrapper 8.7
+        run: |
+          set -e
+          curl -fsSL -o /tmp/gradle-8.7-bin.zip https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          sudo unzip -qo /tmp/gradle-8.7-bin.zip -d /opt
+          /opt/gradle-8.7/bin/gradle wrapper --gradle-version 8.7
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Build Debug APK
+        env:
+          GRADLE_OPTS: -Xmx4g -Dorg.gradle.daemon=false
+        run: |
+          set -o pipefail
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          ./gradlew clean assembleDebug --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-build.log
+          tail -n 50 /tmp/gradle-build.log || true
+
+      - name: Prepare dist APK
+        if: success()
+        run: |
+          set -e
+          mkdir -p dist
+          APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
+          test -s "$APK"
+          cp "$APK" dist/Titan-PRO-v2.1.2-FULL.apk
+          ls -lh dist/
+          sha256sum dist/Titan-PRO-v2.1.2-FULL.apk
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Titan-PRO-v212-FULL-APK
+          path: dist/Titan-PRO-v2.1.2-FULL.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.1.2-android
+          name: Titan PRO v2.1.2 GLASS-AUTOPILOT FULL APK
+          body: |
+            TITAN PRO v2.1.2 GLASS-AUTOPILOT — APK کامل
+            - سورس کامل ماژولار داخل APK (Glass UI + Autopilot + Learning + Governor)
+            - آیکون نئونی جدید
+            - UI مدرن + همه تب‌ها و نمودارها
+            - داده در Internal Storage/YYY
+            نصب: Uninstall قبلی، نصب این APK، مجوز All files، ۱–۲ دقیقه صبر.
+          files: dist/Titan-PRO-v2.1.2-FULL.apk
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload gradle log on failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: /tmp/gradle-build.log
+          if-no-files-found: ignore
